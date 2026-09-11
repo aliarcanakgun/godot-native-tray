@@ -1,5 +1,6 @@
 #include "native_tray.h"
 #include <godot_cpp/core/class_db.hpp>
+#include <godot_cpp/core/object.hpp>
 #include <godot_cpp/classes/display_server.hpp>
 #include <godot_cpp/classes/engine.hpp>
 
@@ -23,6 +24,10 @@ void NativeTray::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("add_menu_item", "id", "text", "disabled", "checked"), &NativeTray::add_menu_item, DEFVAL(false), DEFVAL(false));
 	ClassDB::bind_method(D_METHOD("add_menu_separator"), &NativeTray::add_menu_separator);
 
+	ClassDB::bind_method(D_METHOD("set_custom_menu_window", "node"), &NativeTray::set_custom_menu_window);
+	ClassDB::bind_method(D_METHOD("get_custom_menu_window"), &NativeTray::get_custom_menu_window);
+	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "custom_menu_window", PROPERTY_HINT_NODE_TYPE, "Window"), "set_custom_menu_window", "get_custom_menu_window");
+
 	ADD_SIGNAL(MethodInfo("on_tray_left_clicked"));
 	ADD_SIGNAL(MethodInfo("on_tray_right_clicked"));
 	ADD_SIGNAL(MethodInfo("on_tray_double_clicked"));
@@ -30,45 +35,37 @@ void NativeTray::_bind_methods() {
 }
 
 NativeTray::NativeTray() {
-#ifdef _WIN32
-	hwnd = NULL;
-	hMenu = NULL;
-	current_icon = NULL;
-	memset(&nid, 0, sizeof(NOTIFYICONDATAW));
-#endif
 }
 
 NativeTray::~NativeTray() {
 #ifdef _WIN32
 	remove_tray();
-	if (hMenu) {
-		DestroyMenu(hMenu);
-	}
-	if (hwnd) {
-		DestroyWindow(hwnd);
-	}
+	if (hMenu) DestroyMenu(hMenu);
+	if (hwnd) DestroyWindow(hwnd);
 #endif
 }
 
 void NativeTray::init_tray(const String &p_tooltip, const Ref<Image> &p_icon) {
 #ifdef _WIN32
-	if (hwnd != NULL) return; // Already initialized
+	if (hwnd) return; // already initialized
 
-	HINSTANCE hInstance = GetModuleHandle(NULL);
+	HINSTANCE hInstance = GetModuleHandle(nullptr);
 
-	WNDCLASSEXW wc = {0};
-	wc.cbSize = sizeof(WNDCLASSEXW);
+	WNDCLASSEXW wc = {};
+	wc.cbSize = sizeof(wc);
 	wc.lpfnWndProc = NativeTray::WndProc;
 	wc.hInstance = hInstance;
 	wc.lpszClassName = L"GodotNativeTrayMessageWindow";
 	RegisterClassExW(&wc);
 
-	hwnd = CreateWindowExW(0, L"GodotNativeTrayMessageWindow", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInstance, this);
+	hwnd = CreateWindowExW(0, L"GodotNativeTrayMessageWindow", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, hInstance, nullptr);
 	if (!hwnd) return;
+
+	SetWindowLongPtr(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
 
 	hMenu = CreatePopupMenu();
 
-	nid.cbSize = sizeof(NOTIFYICONDATAW);
+	nid.cbSize = sizeof(nid);
 	nid.hWnd = hwnd;
 	nid.uID = 1;
 	nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
@@ -116,17 +113,16 @@ void NativeTray::remove_tray() {
 	Shell_NotifyIconW(NIM_DELETE, &nid);
 	if (current_icon) {
 		DestroyIcon(current_icon);
-		current_icon = NULL;
+		current_icon = nullptr;
 	}
 #endif
 }
 
 void NativeTray::hide_window() {
 #ifdef _WIN32
-	if (Engine::get_singleton()->is_editor_hint()) return; // Don't hide the editor
+	if (Engine::get_singleton()->is_editor_hint()) return;
 	int64_t handle = DisplayServer::get_singleton()->window_get_native_handle(DisplayServer::WINDOW_HANDLE, 0);
-	HWND godot_hwnd = (HWND)handle;
-	if (godot_hwnd) {
+	if (HWND godot_hwnd = reinterpret_cast<HWND>(handle)) {
 		ShowWindow(godot_hwnd, SW_HIDE);
 	}
 #endif
@@ -136,8 +132,7 @@ void NativeTray::show_window() {
 #ifdef _WIN32
 	if (Engine::get_singleton()->is_editor_hint()) return;
 	int64_t handle = DisplayServer::get_singleton()->window_get_native_handle(DisplayServer::WINDOW_HANDLE, 0);
-	HWND godot_hwnd = (HWND)handle;
-	if (godot_hwnd) {
+	if (HWND godot_hwnd = reinterpret_cast<HWND>(handle)) {
 		ShowWindow(godot_hwnd, SW_SHOW);
 		SetForegroundWindow(godot_hwnd);
 	}
@@ -166,21 +161,28 @@ void NativeTray::add_menu_item(int p_id, const String &p_text, bool p_disabled, 
 void NativeTray::add_menu_separator() {
 #ifdef _WIN32
 	if (!hMenu) return;
-	AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+	AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 #endif
+}
+
+void NativeTray::set_custom_menu_window(Window *p_node) {
+	if (p_node) {
+		custom_menu_instance_id = p_node->get_instance_id();
+	} else {
+		custom_menu_instance_id = ObjectID();
+	}
+}
+
+Window *NativeTray::get_custom_menu_window() const {
+	if (custom_menu_instance_id.is_valid()) {
+		return Object::cast_to<Window>(ObjectDB::get_instance(custom_menu_instance_id));
+	}
+	return nullptr;
 }
 
 #ifdef _WIN32
 LRESULT CALLBACK NativeTray::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-	if (msg == WM_NCCREATE) {
-		CREATESTRUCT *pCreate = (CREATESTRUCT*)lParam;
-		NativeTray *pSelf = (NativeTray*)pCreate->lpCreateParams;
-		SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)pSelf);
-		return DefWindowProc(hwnd, msg, wParam, lParam);
-	}
-
-	NativeTray *pSelf = (NativeTray*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
-	if (pSelf) {
+	if (NativeTray *pSelf = reinterpret_cast<NativeTray*>(GetWindowLongPtr(hwnd, GWLP_USERDATA))) {
 		if (msg == WM_TRAYICON) {
 			pSelf->process_tray_message(wParam, lParam);
 			return 0;
@@ -199,11 +201,47 @@ void NativeTray::process_tray_message(WPARAM wParam, LPARAM lParam) {
 			break;
 		case WM_RBUTTONUP: {
 			emit_signal("on_tray_right_clicked");
-			if (hMenu && GetMenuItemCount(hMenu) > 0) {
+			
+			bool handled_by_custom = false;
+			if (custom_menu_instance_id.is_valid()) {
+				if (Window *win = Object::cast_to<Window>(ObjectDB::get_instance(custom_menu_instance_id))) {
+					POINT pt;
+					GetCursorPos(&pt);
+					
+					// prevent the menu from going off-screen
+					Vector2i size = win->get_size();
+					int x = pt.x;
+					int y = pt.y;
+
+					HMONITOR hMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+					MONITORINFO mi = { sizeof(mi) };
+					if (GetMonitorInfo(hMonitor, &mi)) {
+						if (x + size.x > mi.rcWork.right) x = pt.x - size.x;
+						if (y + size.y > mi.rcWork.bottom) y = pt.y - size.y;
+					}
+
+					win->set_position(Vector2i(x, y));
+					win->set_visible(true);
+					
+					int32_t window_id = win->get_window_id();
+					if (window_id != DisplayServer::INVALID_WINDOW_ID) {
+						if (int64_t handle = DisplayServer::get_singleton()->window_get_native_handle(DisplayServer::WINDOW_HANDLE, window_id)) {
+							HWND hw = reinterpret_cast<HWND>(handle);
+							// force the window to be topmost to render over the taskbar.
+							// this bypasses godot's transient error when 'always on top' is used.
+							SetWindowPos(hw, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+							SetForegroundWindow(hw);
+						}
+					}
+					handled_by_custom = true;
+				}
+			}
+			
+			if (!handled_by_custom && hMenu && GetMenuItemCount(hMenu) > 0) {
 				POINT pt;
 				GetCursorPos(&pt);
 				SetForegroundWindow(hwnd);
-				TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd, NULL);
+				TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd, nullptr);
 				PostMessage(hwnd, WM_NULL, 0, 0);
 			}
 			break;
@@ -222,7 +260,7 @@ void NativeTray::process_menu_command(int command_id) {
 }
 
 HICON NativeTray::create_icon_from_image(const Ref<Image> &p_image) {
-	if (p_image.is_null() || p_image->is_empty()) return NULL;
+	if (p_image.is_null() || p_image->is_empty()) return nullptr;
 
 	Ref<Image> img = p_image->duplicate();
 	if (img->get_format() != Image::FORMAT_RGBA8) {
@@ -232,8 +270,8 @@ HICON NativeTray::create_icon_from_image(const Ref<Image> &p_image) {
 	int w = img->get_width();
 	int h = img->get_height();
 
-	BITMAPV5HEADER bi = {0};
-	bi.bV5Size = sizeof(BITMAPV5HEADER);
+	BITMAPV5HEADER bi = {};
+	bi.bV5Size = sizeof(bi);
 	bi.bV5Width = w;
 	bi.bV5Height = -h; // Top-down
 	bi.bV5Planes = 1;
@@ -244,28 +282,24 @@ HICON NativeTray::create_icon_from_image(const Ref<Image> &p_image) {
 	bi.bV5BlueMask = 0x000000FF;
 	bi.bV5AlphaMask = 0xFF000000;
 
-	HDC hdc = GetDC(NULL);
+	HDC hdc = GetDC(nullptr);
 	void *lpBits;
-	HBITMAP hBitmap = CreateDIBSection(hdc, (BITMAPINFO *)&bi, DIB_RGB_COLORS, &lpBits, NULL, 0);
-	ReleaseDC(NULL, hdc);
+	HBITMAP hBitmap = CreateDIBSection(hdc, reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS, &lpBits, nullptr, 0);
+	ReleaseDC(nullptr, hdc);
 
-	if (!hBitmap) return NULL;
+	if (!hBitmap) return nullptr;
 
 	PackedByteArray data = img->get_data();
 	const uint8_t *src = data.ptr();
-	uint32_t *dst = (uint32_t *)lpBits;
+	uint32_t *dst = reinterpret_cast<uint32_t*>(lpBits);
 
-	for (int i = 0; i < w * h; i++) {
-		uint8_t r = src[i * 4 + 0];
-		uint8_t g = src[i * 4 + 1];
-		uint8_t b = src[i * 4 + 2];
-		uint8_t a = src[i * 4 + 3];
-		dst[i] = (a << 24) | (r << 16) | (g << 8) | b;
+	for (int i = 0; i < w * h; i++, src += 4) {
+		dst[i] = (src[3] << 24) | (src[0] << 16) | (src[1] << 8) | src[2];
 	}
 
-	HBITMAP hMonoBitmap = CreateBitmap(w, h, 1, 1, NULL);
+	HBITMAP hMonoBitmap = CreateBitmap(w, h, 1, 1, nullptr);
 
-	ICONINFO ii = {0};
+	ICONINFO ii = {};
 	ii.fIcon = TRUE;
 	ii.hbmMask = hMonoBitmap;
 	ii.hbmColor = hBitmap;

@@ -9,6 +9,7 @@
 
 #include <godot_cpp/classes/object.hpp>
 #include <godot_cpp/classes/image.hpp>
+#include <godot_cpp/classes/window.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
 
 namespace godot {
@@ -18,10 +19,10 @@ class NativeTray : public Object {
 
 private:
 #ifdef _WIN32
-	HWND hwnd = NULL;
-	HMENU hMenu = NULL;
+	HWND hwnd = nullptr;
+	HMENU hMenu = nullptr;
 	NOTIFYICONDATAW nid = {};
-	HICON current_icon = NULL;
+	HICON current_icon = nullptr;
 
 	static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 	void process_tray_message(WPARAM wParam, LPARAM lParam);
@@ -29,6 +30,8 @@ private:
 	
 	HICON create_icon_from_image(const Ref<Image> &p_image);
 #endif
+
+	ObjectID custom_menu_instance_id;
 
 protected:
 	static void _bind_methods();
@@ -48,6 +51,9 @@ public:
 	void clear_menu();
 	void add_menu_item(int p_id, const String &p_text, bool p_disabled = false, bool p_checked = false);
 	void add_menu_separator();
+
+	void set_custom_menu_window(Window *p_node);
+	Window *get_custom_menu_window() const;
 };
 
 } // namespace godot

@@ -7,6 +7,7 @@
 *.pyc
 ~*.dll
 
+.cache
 .vscode
 compile_commands.json
 

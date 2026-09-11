@@ -15,7 +15,10 @@ func _ready() -> void:
 	NativeTray.on_tray_double_clicked.connect(_on_tray_double_clicked)
 	NativeTray.on_menu_item_selected.connect(_on_menu_item_selected)
 	
-	# populate menu
+	# to use a custom godot window/popup instead of native win32 menu:
+	NativeTray.custom_menu_window = $custom_rmb_menu
+	
+	# populate native win32 menu (will be ignored if custom menu is set)
 	NativeTray.add_menu_item(1, "Show Window")
 	NativeTray.add_menu_item(2, "Hide Window")
 	NativeTray.add_menu_separator()
