@@ -1,0 +1,91 @@
+name: Build GDExtension
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            os: windows-latest
+            arch: x86_64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install SCons
+        run: pip install scons
+
+      - name: Build (debug)
+        run: scons platform=${{ matrix.platform }} arch=${{ matrix.arch }} target=template_debug
+
+      - name: Build (release)
+        run: scons platform=${{ matrix.platform }} arch=${{ matrix.arch }} target=template_release
+
+      - name: Prepare Plugin Directory
+        shell: bash
+        run: |
+          mkdir -p demo/addons/godot-native-tray/${{ matrix.platform }}
+          cp -r bin/* demo/addons/godot-native-tray/${{ matrix.platform }}/ || true
+          cp LICENSE demo/addons/godot-native-tray/LICENSE.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: godot-native-tray-${{ matrix.platform }}-${{ matrix.arch }}
+          path: demo/addons/godot-native-tray/
+
+  package:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Merge into single addon folder
+        run: |
+          mkdir -p release/addons/godot-native-tray
+          for dir in artifacts/godot-native-tray-*/; do
+            rsync -a "$dir"/ release/addons/godot-native-tray/
+          done
+          find release/addons/godot-native-tray -name "*.exp" -type f -delete
+          find release/addons/godot-native-tray -name "*.lib" -type f -delete
+
+      - name: Create release ZIP
+        run: |
+          ZIP_NAME="godot-native-tray-${{ github.ref_name }}.zip"
+          cd release && zip -r ../$ZIP_NAME addons/
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: Upload release ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: godot-native-tray-release
+          path: ${{ env.ZIP_NAME }}
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_NAME }}
+          generate_release_notes: true
