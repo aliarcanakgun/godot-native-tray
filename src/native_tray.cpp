@@ -74,13 +74,13 @@ void NativeTray::init_tray(const String &p_tooltip, const Ref<Image> &p_icon) {
 	current_icon = create_icon_from_image(p_icon);
 	nid.hIcon = current_icon;
 
-	wcsncpy_s(nid.szTip, reinterpret_cast<const wchar_t *>(p_tooltip.utf16().get_data()), sizeof(nid.szTip) / sizeof(wchar_t));
+	Char16String utf16 = p_tooltip.utf16();
+	int len = utf16.length();
+	if (len > 127) len = 127;
+	memcpy(nid.szTip, utf16.get_data(), len * sizeof(wchar_t));
+	nid.szTip[len] = 0;
 
 	Shell_NotifyIconW(NIM_ADD, &nid);
-	
-	// try NIF_SHOWTIP to ensure tooltip works on newer windows
-	nid.uVersion = NOTIFYICON_VERSION_4;
-	Shell_NotifyIconW(NIM_SETVERSION, &nid);
 #endif
 }
 
@@ -102,8 +102,15 @@ void NativeTray::update_tooltip(const String &p_tooltip) {
 #ifdef _WIN32
 	if (!hwnd) return;
 	
-	wcsncpy_s(nid.szTip, reinterpret_cast<const wchar_t *>(p_tooltip.utf16().get_data()), sizeof(nid.szTip) / sizeof(wchar_t));
+	Char16String utf16 = p_tooltip.utf16();
+	int len = utf16.length();
+	if (len > 127) len = 127;
+	memcpy(nid.szTip, utf16.get_data(), len * sizeof(wchar_t));
+	nid.szTip[len] = 0;
+	
+	nid.uFlags = NIF_TIP;
 	Shell_NotifyIconW(NIM_MODIFY, &nid);
+	nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
 #endif
 }
 
