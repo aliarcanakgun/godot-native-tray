@@ -5,12 +5,14 @@
 *.os
 *.o
 *.pyc
+~*.dll
+
+.vscode
+compile_commands.json
+
+.vscode
+compile_commands.json
 
 # compiled binaries
-demo/addons/gd-global-input/linux/*
-demo/addons/gd-global-input/macos/*
-demo/addons/gd-global-input/windows/*
-
-!demo/addons/gd-global-input/linux/.gitkeep
-!demo/addons/gd-global-input/macos/.gitkeep
-!demo/addons/gd-global-input/windows/.gitkeep
+demo/addons/godot-native-tray/windows/*
+!demo/addons/godot-native-tray/windows/.gitkeep
