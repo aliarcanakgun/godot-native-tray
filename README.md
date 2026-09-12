@@ -20,7 +20,7 @@ Currently, it only supports **Windows**.
 1. Go to the [Releases](https://github.com/aliarcanakgun/godot-native-tray/releases) page.
 2. Download the latest release `.zip` archive.
 3. Extract the contents directly into your Godot project's folder. It should create an `addons/godot-native-tray/` structure.
-4. Reload your Godot project. The extension will automatically load and be ready to use.
+4. The extension will automatically load and be ready to use (Reload your project if needed).
 
 ### Method 2: Building from Source
 
