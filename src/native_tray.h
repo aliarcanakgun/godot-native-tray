@@ -23,12 +23,16 @@ private:
 	HMENU hMenu = nullptr;
 	NOTIFYICONDATAW nid = {};
 	HICON current_icon = nullptr;
+	bool is_active = false;
+
+	static UINT wm_taskbar_created;
 
 	static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 	void process_tray_message(WPARAM wParam, LPARAM lParam);
 	void process_menu_command(int command_id);
 	
 	HICON create_icon_from_image(const Ref<Image> &p_image);
+	void set_tooltip_internal(const String &p_tooltip);
 #endif
 
 	ObjectID custom_menu_instance_id;
@@ -44,6 +48,8 @@ public:
 	void update_icon(const Ref<Image> &p_icon);
 	void update_tooltip(const String &p_tooltip);
 	void remove_tray();
+	void recreate_tray();
+	bool is_tray_active() const;
 	
 	void hide_window();
 	void show_window();

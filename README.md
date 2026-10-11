@@ -8,6 +8,7 @@ Currently, it only supports **Windows**.
 
 - **System Tray Icon:** Add your app to the Windows system tray with a custom icon and tooltip.
 - **Click Detection:** Detect left, right, and double clicks on the tray icon.
+- **Explorer Crash / Restart Recovery:** Automatically intercepts Windows `TaskbarCreated` broadcast to restore the tray icon seamlessly if Windows Explorer restarts.
 - **Native Context Menu:** Built-in standard Windows context menu with separators, disabled states, and checked states.
 - **Custom Godot Window Menu:** Ability to set a custom Godot `Window` node to act as the menu (bypassing the standard Win32 menu).
 - **Window Management:** Hide and show the main Godot window programmatically.
@@ -75,6 +76,7 @@ func _ready():
     NativeTray.on_tray_left_clicked.connect(_on_left_click)
     NativeTray.on_tray_right_clicked.connect(_on_right_click)
     NativeTray.on_tray_double_clicked.connect(_on_double_click)
+    NativeTray.on_tray_recreated.connect(_on_tray_recreated)
 
 func _on_left_click():
     print("Tray left clicked")
@@ -84,6 +86,9 @@ func _on_right_click():
     
 func _on_double_click():
     print("Tray double clicked")
+
+func _on_tray_recreated():
+    print("Explorer restarted, tray icon automatically recreated")
 ```
 
 ### Native Context Menu

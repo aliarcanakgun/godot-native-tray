@@ -14,6 +14,7 @@ func _ready() -> void:
 	NativeTray.on_tray_right_clicked.connect(_on_tray_right_clicked)
 	NativeTray.on_tray_double_clicked.connect(_on_tray_double_clicked)
 	NativeTray.on_menu_item_selected.connect(_on_menu_item_selected)
+	NativeTray.on_tray_recreated.connect(_on_tray_recreated)
 	
 	# to use a custom godot window/popup instead of native win32 menu:
 	#NativeTray.custom_menu_window = $custom_rmb_menu
@@ -42,6 +43,9 @@ func _on_tray_right_clicked() -> void:
 func _on_tray_double_clicked() -> void:
 	print("Tray Double Clicked!")
 	NativeTray.show_window()
+
+func _on_tray_recreated() -> void:
+	print("Explorer restarted! Tray icon was automatically restored.")
 
 func _on_menu_item_selected(id: int) -> void:
 	print("Menu Item Selected: ", id)
