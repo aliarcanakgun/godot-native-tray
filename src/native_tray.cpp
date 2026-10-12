@@ -3,6 +3,8 @@
 #include <godot_cpp/core/object.hpp>
 #include <godot_cpp/classes/display_server.hpp>
 #include <godot_cpp/classes/engine.hpp>
+#include <godot_cpp/classes/file_access.hpp>
+#include <godot_cpp/classes/project_settings.hpp>
 
 using namespace godot;
 
@@ -14,11 +16,32 @@ UINT NativeTray::wm_taskbar_created = 0;
 #ifndef MSGFLT_ALLOW
 #define MSGFLT_ALLOW 1
 #endif
+
+#pragma pack(push, 1)
+struct IcoHeader {
+	uint16_t reserved;
+	uint16_t type;
+	uint16_t count;
+};
+
+struct IcoDirEntry {
+	uint8_t width;
+	uint8_t height;
+	uint8_t color_count;
+	uint8_t reserved;
+	uint16_t planes;
+	uint16_t bit_count;
+	uint32_t bytes_in_res;
+	uint32_t image_offset;
+};
+#pragma pack(pop)
 #endif
 
 void NativeTray::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("init_tray", "tooltip", "icon"), &NativeTray::init_tray);
+	ClassDB::bind_method(D_METHOD("init_tray_ico", "tooltip", "path"), &NativeTray::init_tray_ico);
 	ClassDB::bind_method(D_METHOD("update_icon", "icon"), &NativeTray::update_icon);
+	ClassDB::bind_method(D_METHOD("update_icon_ico", "path"), &NativeTray::update_icon_ico);
 	ClassDB::bind_method(D_METHOD("update_tooltip", "tooltip"), &NativeTray::update_tooltip);
 	ClassDB::bind_method(D_METHOD("remove_tray"), &NativeTray::remove_tray);
 	ClassDB::bind_method(D_METHOD("recreate_tray"), &NativeTray::recreate_tray);
@@ -74,7 +97,7 @@ void NativeTray::set_tooltip_internal(const String &p_tooltip) {
 }
 #endif
 
-void NativeTray::init_tray(const String &p_tooltip, const Ref<Image> &p_icon) {
+void NativeTray::init_tray(const String &p_tooltip, const Variant &p_icon) {
 #ifdef _WIN32
 	HINSTANCE hInstance = GetModuleHandle(nullptr);
 
@@ -125,7 +148,7 @@ void NativeTray::init_tray(const String &p_tooltip, const Ref<Image> &p_icon) {
 		current_icon = nullptr;
 	}
 
-	current_icon = create_icon_from_image(p_icon);
+	current_icon = create_icon_from_variant(p_icon);
 
 	nid.cbSize = sizeof(nid);
 	nid.hWnd = hwnd;
@@ -146,11 +169,15 @@ void NativeTray::init_tray(const String &p_tooltip, const Ref<Image> &p_icon) {
 #endif
 }
 
-void NativeTray::update_icon(const Ref<Image> &p_icon) {
+void NativeTray::init_tray_ico(const String &p_tooltip, const String &p_path) {
+	init_tray(p_tooltip, p_path);
+}
+
+void NativeTray::update_icon(const Variant &p_icon) {
 #ifdef _WIN32
 	if (!hwnd || !is_active) return;
 	
-	HICON new_icon = create_icon_from_image(p_icon);
+	HICON new_icon = create_icon_from_variant(p_icon);
 	if (new_icon) {
 		if (current_icon) DestroyIcon(current_icon);
 		current_icon = new_icon;
@@ -165,6 +192,10 @@ void NativeTray::update_icon(const Ref<Image> &p_icon) {
 		Shell_NotifyIconW(NIM_MODIFY, &icon_nid);
 	}
 #endif
+}
+
+void NativeTray::update_icon_ico(const String &p_path) {
+	update_icon(p_path);
 }
 
 void NativeTray::update_tooltip(const String &p_tooltip) {
@@ -446,5 +477,124 @@ HICON NativeTray::create_icon_from_image(const Ref<Image> &p_image) {
 	if (hMonoBitmap) DeleteObject(hMonoBitmap);
 
 	return hIcon;
+}
+
+HICON NativeTray::create_icon_from_variant(const Variant &p_icon) {
+	if (p_icon.get_type() == Variant::OBJECT) {
+		Ref<Image> img = p_icon;
+		if (img.is_valid()) {
+			return create_icon_from_image(img);
+		}
+	} else if (p_icon.get_type() == Variant::STRING) {
+		String path = p_icon;
+		if (!path.is_empty()) {
+			return create_icon_from_file(path);
+		}
+	}
+
+	return create_icon_from_image(Ref<Image>());
+}
+
+HICON NativeTray::create_icon_from_file(const String &p_path) {
+	if (p_path.is_empty()) return nullptr;
+
+	String ext = p_path.get_extension().to_lower();
+	if (ext != "ico") {
+		String global_path = ProjectSettings::get_singleton()->globalize_path(p_path);
+		Ref<Image> img = Image::load_from_file(global_path);
+		if (img.is_valid() && !img->is_empty()) {
+			return create_icon_from_image(img);
+		}
+	}
+
+	Ref<FileAccess> file = FileAccess::open(p_path, FileAccess::READ);
+	if (file.is_valid()) {
+		uint64_t len = file->get_length();
+		if (len > 0 && len < 16 * 1024 * 1024) {
+			PackedByteArray buf = file->get_buffer(len);
+			HICON hIcon = create_icon_from_ico_data(buf.ptr(), buf.size());
+			if (hIcon) return hIcon;
+		}
+	}
+	
+	String global_path = ProjectSettings::get_singleton()->globalize_path(p_path);
+	Char16String utf16 = global_path.utf16();
+	int target_cx = GetSystemMetrics(SM_CXSMICON);
+	int target_cy = GetSystemMetrics(SM_CYSMICON);
+	if (target_cx <= 0) target_cx = 16;
+	if (target_cy <= 0) target_cy = 16;
+
+	HICON hIcon = reinterpret_cast<HICON>(LoadImageW(
+		nullptr,
+		reinterpret_cast<LPCWSTR>(utf16.get_data()),
+		IMAGE_ICON,
+		target_cx,
+		target_cy,
+		LR_LOADFROMFILE
+	));
+	return hIcon;
+}
+
+HICON NativeTray::create_icon_from_ico_data(const uint8_t *p_data, size_t p_size) {
+	if (!p_data || p_size < sizeof(IcoHeader)) return nullptr;
+
+	const IcoHeader *header = reinterpret_cast<const IcoHeader*>(p_data);
+	if (header->reserved != 0 || header->type != 1 || header->count == 0) {
+		return nullptr;
+	}
+
+	if (p_size < sizeof(IcoHeader) + header->count * sizeof(IcoDirEntry)) {
+		return nullptr;
+	}
+
+	const IcoDirEntry *entries = reinterpret_cast<const IcoDirEntry*>(p_data + sizeof(IcoHeader));
+
+	int target_cx = GetSystemMetrics(SM_CXSMICON);
+	int target_cy = GetSystemMetrics(SM_CYSMICON);
+	if (target_cx <= 0) target_cx = 16;
+	if (target_cy <= 0) target_cy = 16;
+
+	int best_index = -1;
+	int best_score = 100000;
+
+	for (int i = 0; i < header->count; i++) {
+		int w = entries[i].width == 0 ? 256 : entries[i].width;
+		int h = entries[i].height == 0 ? 256 : entries[i].height;
+
+		if (w == target_cx && h == target_cy) {
+			best_index = i;
+			break;
+		}
+
+		int score = 0;
+		if (w >= target_cx && h >= target_cy) {
+			score = (w - target_cx) + (h - target_cy);
+		} else {
+			score = 1000 + (target_cx - w) + (target_cy - h);
+		}
+
+		if (score < best_score) {
+			best_score = score;
+			best_index = i;
+		}
+	}
+
+	if (best_index < 0) return nullptr;
+
+	const IcoDirEntry &best = entries[best_index];
+	if (best.image_offset + best.bytes_in_res > p_size) {
+		return nullptr;
+	}
+
+	const uint8_t *icon_bytes = p_data + best.image_offset;
+	return CreateIconFromResourceEx(
+		const_cast<PBYTE>(icon_bytes),
+		best.bytes_in_res,
+		TRUE,
+		0x00030000,
+		target_cx,
+		target_cy,
+		LR_DEFAULTCOLOR
+	);
 }
 #endif

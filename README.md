@@ -50,12 +50,13 @@ The extension provides a `NativeTray` singleton that you can access from any GDS
 
 ### Initializing the Tray
 
-**Add the icon to the system tray with a tooltip:**
+**Add the icon to the system tray with a tooltip (accepts either `Image` or `.ico` path):**
 ```gdscript
-# Load your icon
-var icon = preload("res://icon.svg").get_image()
+# Using a native .ico file (auto selects best DPI resolution)
+NativeTray.init_tray("My Godot App", "res://icon.ico")
 
-# Initialize the tray
+# Using an Image (PNG, SVG, etc.)
+var icon = preload("res://icon.svg").get_image()
 NativeTray.init_tray("My Godot App", icon)
 ```
 
@@ -63,8 +64,10 @@ NativeTray.init_tray("My Godot App", icon)
 
 **Update the icon or tooltip dynamically:**
 ```gdscript
-var new_icon = preload("res://new_icon.png").get_image()
-NativeTray.update_icon(new_icon)
+# Update using a .ico path or an Image
+NativeTray.update_icon("res://status_busy.ico")
+# or NativeTray.update_icon(new_image)
+
 NativeTray.update_tooltip("Status: Connected")
 ```
 

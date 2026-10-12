@@ -11,6 +11,7 @@
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/window.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
+#include <godot_cpp/variant/variant.hpp>
 
 namespace godot {
 
@@ -31,7 +32,10 @@ private:
 	void process_tray_message(WPARAM wParam, LPARAM lParam);
 	void process_menu_command(int command_id);
 	
+	HICON create_icon_from_variant(const Variant &p_icon);
 	HICON create_icon_from_image(const Ref<Image> &p_image);
+	HICON create_icon_from_file(const String &p_path);
+	HICON create_icon_from_ico_data(const uint8_t *p_data, size_t p_size);
 	void set_tooltip_internal(const String &p_tooltip);
 #endif
 
@@ -44,8 +48,10 @@ public:
 	NativeTray();
 	~NativeTray();
 
-	void init_tray(const String &p_tooltip, const Ref<Image> &p_icon);
-	void update_icon(const Ref<Image> &p_icon);
+	void init_tray(const String &p_tooltip, const Variant &p_icon);
+	void init_tray_ico(const String &p_tooltip, const String &p_path);
+	void update_icon(const Variant &p_icon);
+	void update_icon_ico(const String &p_path);
 	void update_tooltip(const String &p_tooltip);
 	void remove_tray();
 	void recreate_tray();
