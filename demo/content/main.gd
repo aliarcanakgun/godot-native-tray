@@ -15,6 +15,8 @@ func _ready() -> void:
 	NativeTray.on_tray_double_clicked.connect(_on_tray_double_clicked)
 	NativeTray.on_menu_item_selected.connect(_on_menu_item_selected)
 	NativeTray.on_tray_recreated.connect(_on_tray_recreated)
+	NativeTray.on_system_suspend.connect(_on_system_suspend)
+	NativeTray.on_system_resume.connect(_on_system_resume)
 	
 	# to use a custom godot window/popup instead of native win32 menu:
 	#NativeTray.custom_menu_window = $custom_rmb_menu
@@ -46,6 +48,12 @@ func _on_tray_double_clicked() -> void:
 
 func _on_tray_recreated() -> void:
 	print("Explorer restarted! Tray icon was automatically restored.")
+
+func _on_system_suspend() -> void:
+	print("System is entering sleep/standby mode.")
+
+func _on_system_resume() -> void:
+	print("System resumed from sleep/standby mode.")
 
 func _on_menu_item_selected(id: int) -> void:
 	print("Menu Item Selected: ", id)

@@ -5,6 +5,8 @@
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
+#include <godot_cpp/classes/rendering_server.hpp>
+#include <godot_cpp/classes/scene_tree.hpp>
 
 using namespace godot;
 
@@ -13,9 +15,96 @@ const UINT WM_TRAYICON = WM_USER + 1;
 const UINT MENU_ID_OFFSET = 1000;
 UINT NativeTray::wm_taskbar_created = 0;
 
+static volatile LONG g_prefetch_in_progress = 0;
+
 #ifndef MSGFLT_ALLOW
 #define MSGFLT_ALLOW 1
 #endif
+
+#ifndef DWMWA_TRANSITIONS_FORCEDISABLED
+#define DWMWA_TRANSITIONS_FORCEDISABLED 3
+#endif
+
+#ifndef PBT_APMSUSPEND
+#define PBT_APMSUSPEND 0x0004
+#endif
+#ifndef PBT_APMRESUMESUSPEND
+#define PBT_APMRESUMESUSPEND 0x0007
+#endif
+#ifndef PBT_APMRESUMEAUTOMATIC
+#define PBT_APMRESUMEAUTOMATIC 0x0012
+#endif
+
+namespace {
+
+struct TrayMemoryPriorityInfo {
+	ULONG MemoryPriority;
+};
+
+struct TrayProcessPowerThrottlingState {
+	ULONG Version;
+	ULONG ControlMask;
+	ULONG StateMask;
+};
+
+struct TrayWin32MemoryRangeEntry {
+	PVOID VirtualAddress;
+	SIZE_T NumberOfBytes;
+};
+
+typedef BOOL(WINAPI *PFN_SetProcessInformation)(
+	HANDLE hProcess,
+	int ProcessInformationClass,
+	LPVOID ProcessInformation,
+	DWORD ProcessInformationSize
+);
+
+typedef BOOL(WINAPI *PFN_PrefetchVirtualMemory)(
+	HANDLE hProcess,
+	ULONG_PTR NumberOfEntries,
+	TrayWin32MemoryRangeEntry *VirtualAddresses,
+	ULONG Flags
+);
+
+typedef HRESULT(WINAPI *PFN_DwmSetWindowAttribute)(
+	HWND hwnd,
+	DWORD dwAttribute,
+	LPCVOID pvAttribute,
+	DWORD cbAttribute
+);
+
+typedef HRESULT(WINAPI *PFN_DwmFlush)(void);
+
+typedef UINT(WINAPI *PFN_timeBeginPeriod)(UINT uPeriod);
+typedef UINT(WINAPI *PFN_timeEndPeriod)(UINT uPeriod);
+
+void set_dwm_transitions_disabled(HWND p_hwnd, BOOL p_disabled) {
+	if (!p_hwnd) return;
+	HMODULE hDwm = GetModuleHandleW(L"dwmapi.dll");
+	if (!hDwm) {
+		hDwm = LoadLibraryW(L"dwmapi.dll");
+	}
+	if (hDwm) {
+		PFN_DwmSetWindowAttribute pfnSetAttr = reinterpret_cast<PFN_DwmSetWindowAttribute>(
+			GetProcAddress(hDwm, "DwmSetWindowAttribute")
+		);
+		if (pfnSetAttr) {
+			pfnSetAttr(p_hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, &p_disabled, sizeof(p_disabled));
+		}
+	}
+}
+
+void flush_dwm_composition() {
+	HMODULE hDwm = GetModuleHandleW(L"dwmapi.dll");
+	if (hDwm) {
+		PFN_DwmFlush pfnFlush = reinterpret_cast<PFN_DwmFlush>(GetProcAddress(hDwm, "DwmFlush"));
+		if (pfnFlush) {
+			pfnFlush();
+		}
+	}
+}
+
+}
 
 #pragma pack(push, 1)
 struct IcoHeader {
@@ -46,9 +135,11 @@ void NativeTray::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("remove_tray"), &NativeTray::remove_tray);
 	ClassDB::bind_method(D_METHOD("recreate_tray"), &NativeTray::recreate_tray);
 	ClassDB::bind_method(D_METHOD("is_tray_active"), &NativeTray::is_tray_active);
+	ClassDB::bind_method(D_METHOD("get_tray_rect"), &NativeTray::get_tray_rect);
 
 	ClassDB::bind_method(D_METHOD("hide_window"), &NativeTray::hide_window);
 	ClassDB::bind_method(D_METHOD("show_window"), &NativeTray::show_window);
+	ClassDB::bind_method(D_METHOD("is_window_hidden"), &NativeTray::is_window_hidden);
 
 	ClassDB::bind_method(D_METHOD("clear_menu"), &NativeTray::clear_menu);
 	ClassDB::bind_method(D_METHOD("add_menu_item", "id", "text", "disabled", "checked"), &NativeTray::add_menu_item, DEFVAL(false), DEFVAL(false));
@@ -58,29 +149,74 @@ void NativeTray::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_custom_menu_window"), &NativeTray::get_custom_menu_window);
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "custom_menu_window", PROPERTY_HINT_NODE_TYPE, "Window"), "set_custom_menu_window", "get_custom_menu_window");
 
+#ifdef _WIN32
+	ClassDB::bind_method(D_METHOD("_deferred_post_show_refresh"), &NativeTray::_deferred_post_show_refresh);
+#endif
+	ClassDB::bind_method(D_METHOD("_bind_shutdown_cleanup"), &NativeTray::_bind_shutdown_cleanup);
+	ClassDB::bind_method(D_METHOD("_on_engine_shutdown"), &NativeTray::_on_engine_shutdown);
+
 	ADD_SIGNAL(MethodInfo("on_tray_left_clicked"));
 	ADD_SIGNAL(MethodInfo("on_tray_right_clicked"));
 	ADD_SIGNAL(MethodInfo("on_tray_double_clicked"));
 	ADD_SIGNAL(MethodInfo("on_menu_item_selected", PropertyInfo(Variant::INT, "id")));
 	ADD_SIGNAL(MethodInfo("on_tray_recreated"));
+	ADD_SIGNAL(MethodInfo("on_system_suspend"));
+	ADD_SIGNAL(MethodInfo("on_system_resume"));
 }
 
 NativeTray::NativeTray() {
+	call_deferred("_bind_shutdown_cleanup");
 }
 
 NativeTray::~NativeTray() {
 #ifdef _WIN32
-	remove_tray();
+	cleanup_tray_resources();
 	if (hMenu) {
 		DestroyMenu(hMenu);
 		hMenu = nullptr;
 	}
-	if (hwnd) {
-		DestroyWindow(hwnd);
-		hwnd = nullptr;
-		UnregisterClassW(L"GodotNativeTrayMessageWindow", GetModuleHandle(nullptr));
-	}
 #endif
+}
+
+void NativeTray::disconnect_all_signals() {
+	// release lambda callables
+	// before scriptserver tears down
+	TypedArray<Dictionary> signals = get_signal_list();
+	for (int i = 0; i < signals.size(); i++) {
+		Dictionary sig_info = signals[i];
+		StringName sig_name = sig_info["name"];
+		TypedArray<Dictionary> connections = get_signal_connection_list(sig_name);
+		for (int j = 0; j < connections.size(); j++) {
+			Dictionary conn = connections[j];
+			Callable callable = conn["callable"];
+			if (is_connected(sig_name, callable)) {
+				disconnect(sig_name, callable);
+			}
+		}
+	}
+}
+
+void NativeTray::_bind_shutdown_cleanup() {
+	if (shutdown_hook_bound) return;
+
+	Engine *engine = Engine::get_singleton();
+	if (!engine || engine->is_editor_hint()) return;
+
+	SceneTree *tree = Object::cast_to<SceneTree>(engine->get_main_loop());
+	if (!tree) return;
+
+	Window *root = tree->get_root();
+	if (!root) return;
+
+	Callable cb(this, "_on_engine_shutdown");
+	if (!root->is_connected("tree_exited", cb)) {
+		root->connect("tree_exited", cb, CONNECT_ONE_SHOT);
+	}
+	shutdown_hook_bound = true;
+}
+
+void NativeTray::_on_engine_shutdown() {
+	remove_tray();
 }
 
 #ifdef _WIN32
@@ -94,6 +230,202 @@ void NativeTray::set_tooltip_internal(const String &p_tooltip) {
 		nid.szTip[0] = L'\0';
 	}
 	nid.szTip[max_chars] = L'\0';
+}
+
+void NativeTray::restore_process_qos_and_priority() {
+	HANDLE hProcess = GetCurrentProcess();
+
+	DWORD prio_class = GetPriorityClass(hProcess);
+	if (prio_class == IDLE_PRIORITY_CLASS || prio_class == BELOW_NORMAL_PRIORITY_CLASS) {
+		SetPriorityClass(hProcess, NORMAL_PRIORITY_CLASS);
+	}
+
+	HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+	if (hKernel32) {
+		PFN_SetProcessInformation pfnSetProcInfo = reinterpret_cast<PFN_SetProcessInformation>(
+			GetProcAddress(hKernel32, "SetProcessInformation")
+		);
+		if (pfnSetProcInfo) {
+			// disable ecoqos and
+			// timer resolution throttling
+			TrayProcessPowerThrottlingState throttling = {};
+			throttling.Version = 1;
+			throttling.ControlMask = 0x1 | 0x4;
+			throttling.StateMask = 0;
+			if (!pfnSetProcInfo(hProcess, 4, &throttling, sizeof(throttling))) {
+				throttling.ControlMask = 0x1;
+				throttling.StateMask = 0;
+				pfnSetProcInfo(hProcess, 4, &throttling, sizeof(throttling));
+			}
+
+			// restore normal memory page priority
+			TrayMemoryPriorityInfo mem_prio = {};
+			mem_prio.MemoryPriority = 5;
+			pfnSetProcInfo(hProcess, 1, &mem_prio, sizeof(mem_prio));
+		}
+	}
+
+	// refresh timer resolution
+	// for low processor usage mode
+	HMODULE hWinmm = GetModuleHandleW(L"winmm.dll");
+	if (hWinmm) {
+		PFN_timeBeginPeriod pfnBegin = reinterpret_cast<PFN_timeBeginPeriod>(GetProcAddress(hWinmm, "timeBeginPeriod"));
+		PFN_timeEndPeriod pfnEnd = reinterpret_cast<PFN_timeEndPeriod>(GetProcAddress(hWinmm, "timeEndPeriod"));
+		if (pfnBegin && pfnEnd) {
+			pfnBegin(1);
+			pfnEnd(1);
+		}
+	}
+}
+
+DWORD WINAPI NativeTray::PrefetchWorkerThreadProc(LPVOID lpParameter) {
+	if (InterlockedCompareExchange(&g_prefetch_in_progress, 1, 0) != 0) {
+		return 0;
+	}
+
+	HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+	if (!hKernel32) {
+		InterlockedExchange(&g_prefetch_in_progress, 0);
+		return 0;
+	}
+
+	PFN_PrefetchVirtualMemory pfnPrefetch = reinterpret_cast<PFN_PrefetchVirtualMemory>(
+		GetProcAddress(hKernel32, "PrefetchVirtualMemory")
+	);
+	if (!pfnPrefetch) {
+		InterlockedExchange(&g_prefetch_in_progress, 0);
+		return 0;
+	}
+
+	HANDLE hProcess = GetCurrentProcess();
+	SYSTEM_INFO sysInfo = {};
+	GetSystemInfo(&sysInfo);
+
+	const uint8_t *addr = static_cast<const uint8_t *>(sysInfo.lpMinimumApplicationAddress);
+	const uint8_t *max_addr = static_cast<const uint8_t *>(sysInfo.lpMaximumApplicationAddress);
+
+	constexpr size_t BATCH_SIZE = 128;
+	constexpr SIZE_T MAX_PREFETCH_BYTES = 512ULL * 1024ULL * 1024ULL;
+	TrayWin32MemoryRangeEntry entries[BATCH_SIZE];
+	size_t entry_count = 0;
+	SIZE_T total_prefetched = 0;
+
+	MEMORY_BASIC_INFORMATION mbi = {};
+	while (addr < max_addr && total_prefetched < MAX_PREFETCH_BYTES) {
+		if (VirtualQuery(addr, &mbi, sizeof(mbi)) == 0) {
+			break;
+		}
+
+		bool is_committed = (mbi.State == MEM_COMMIT);
+		bool is_valid_type = (mbi.Type == MEM_PRIVATE || mbi.Type == MEM_IMAGE);
+		bool is_accessible = (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+		                                     PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+		bool is_guarded = (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0;
+
+		if (is_committed && is_valid_type && is_accessible && !is_guarded && mbi.RegionSize > 0) {
+			entries[entry_count].VirtualAddress = mbi.BaseAddress;
+			entries[entry_count].NumberOfBytes = mbi.RegionSize;
+			entry_count++;
+			total_prefetched += mbi.RegionSize;
+
+			if (entry_count == BATCH_SIZE) {
+				pfnPrefetch(hProcess, entry_count, entries, 0);
+				entry_count = 0;
+			}
+		}
+
+		const uint8_t *next_addr = static_cast<const uint8_t *>(mbi.BaseAddress) + mbi.RegionSize;
+		if (next_addr <= addr) {
+			break;
+		}
+		addr = next_addr;
+	}
+
+	if (entry_count > 0) {
+		pfnPrefetch(hProcess, entry_count, entries, 0);
+	}
+
+	InterlockedExchange(&g_prefetch_in_progress, 0);
+	return 0;
+}
+
+void NativeTray::prefetch_process_working_set(bool p_async) {
+	if (p_async) {
+		QueueUserWorkItem(&NativeTray::PrefetchWorkerThreadProc, nullptr, WT_EXECUTEDEFAULT);
+	} else {
+		PrefetchWorkerThreadProc(nullptr);
+	}
+}
+
+void NativeTray::force_swapchain_and_dwm_refresh(HWND p_godot_hwnd) {
+	if (!p_godot_hwnd) return;
+
+	SetWindowPos(
+		p_godot_hwnd,
+		nullptr,
+		0, 0, 0, 0,
+		SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+	);
+
+	// rebind vsync to refresh swapchain state
+	if (DisplayServer *ds = DisplayServer::get_singleton()) {
+		DisplayServer::VSyncMode vsync = ds->window_get_vsync_mode(DisplayServer::MAIN_WINDOW_ID);
+		ds->window_set_vsync_mode(vsync, DisplayServer::MAIN_WINDOW_ID);
+	}
+
+	RECT rc = {};
+	if (GetClientRect(p_godot_hwnd, &rc)) {
+		LONG w = rc.right - rc.left;
+		LONG h = rc.bottom - rc.top;
+		if (w > 0 && h > 0) {
+			WPARAM size_state = IsZoomed(p_godot_hwnd) ? SIZE_MAXIMIZED : SIZE_RESTORED;
+			SendMessageW(p_godot_hwnd, WM_SIZE, size_state, MAKELPARAM(w, h));
+		}
+	}
+
+	RedrawWindow(
+		p_godot_hwnd,
+		nullptr,
+		nullptr,
+		RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW
+	);
+	flush_dwm_composition();
+
+	call_deferred("_deferred_post_show_refresh");
+}
+
+void NativeTray::_deferred_post_show_refresh() {
+	if (Engine::get_singleton()->is_editor_hint()) return;
+	if (RenderingServer *rs = RenderingServer::get_singleton()) {
+		rs->force_draw(true, 0.0);
+	}
+}
+
+void NativeTray::force_foreground_window(HWND p_godot_hwnd) {
+	if (!p_godot_hwnd) return;
+
+	HWND fg_hwnd = GetForegroundWindow();
+	DWORD current_thread_id = GetCurrentThreadId();
+	DWORD fg_thread_id = fg_hwnd ? GetWindowThreadProcessId(fg_hwnd, nullptr) : 0;
+
+	bool attached = false;
+	if (fg_thread_id != 0 && fg_thread_id != current_thread_id) {
+		attached = (AttachThreadInput(fg_thread_id, current_thread_id, TRUE) != FALSE);
+	}
+
+	AllowSetForegroundWindow(ASFW_ANY);
+	BringWindowToTop(p_godot_hwnd);
+	SetForegroundWindow(p_godot_hwnd);
+	SetActiveWindow(p_godot_hwnd);
+	SetFocus(p_godot_hwnd);
+
+	if (attached) {
+		AttachThreadInput(fg_thread_id, current_thread_id, FALSE);
+	}
+
+	if (DisplayServer *ds = DisplayServer::get_singleton()) {
+		ds->window_move_to_foreground(DisplayServer::MAIN_WINDOW_ID);
+	}
 }
 #endif
 
@@ -143,6 +475,8 @@ void NativeTray::init_tray(const String &p_tooltip, const Variant &p_icon) {
 		}
 	}
 
+	cached_icon_source = p_icon;
+
 	if (current_icon) {
 		DestroyIcon(current_icon);
 		current_icon = nullptr;
@@ -166,6 +500,8 @@ void NativeTray::init_tray(const String &p_tooltip, const Variant &p_icon) {
 			is_active = true;
 		}
 	}
+
+	_bind_shutdown_cleanup();
 #endif
 }
 
@@ -176,7 +512,8 @@ void NativeTray::init_tray_ico(const String &p_tooltip, const String &p_path) {
 void NativeTray::update_icon(const Variant &p_icon) {
 #ifdef _WIN32
 	if (!hwnd || !is_active) return;
-	
+
+	cached_icon_source = p_icon;
 	HICON new_icon = create_icon_from_variant(p_icon);
 	if (new_icon) {
 		if (current_icon) DestroyIcon(current_icon);
@@ -214,22 +551,47 @@ void NativeTray::update_tooltip(const String &p_tooltip) {
 #endif
 }
 
-void NativeTray::remove_tray() {
 #ifdef _WIN32
-	if (!hwnd || !is_active) return;
-	Shell_NotifyIconW(NIM_DELETE, &nid);
+void NativeTray::cleanup_tray_resources() {
+	if (is_active && hwnd) {
+		Shell_NotifyIconW(NIM_DELETE, &nid);
+	}
 	if (current_icon) {
 		DestroyIcon(current_icon);
 		current_icon = nullptr;
 	}
 	nid.hIcon = nullptr;
 	is_active = false;
+
+	if (hwnd) {
+		SetWindowLongPtr(hwnd, GWLP_USERDATA, 0);
+		DestroyWindow(hwnd);
+		hwnd = nullptr;
+		UnregisterClassW(L"GodotNativeTrayMessageWindow", GetModuleHandle(nullptr));
+	}
+}
 #endif
+
+void NativeTray::remove_tray() {
+#ifdef _WIN32
+	cleanup_tray_resources();
+#endif
+	cached_icon_source = Variant();
+	disconnect_all_signals();
 }
 
 void NativeTray::recreate_tray() {
 #ifdef _WIN32
 	if (!is_active || !hwnd) return;
+
+	if (cached_icon_source.get_type() != Variant::NIL) {
+		HICON refreshed_icon = create_icon_from_variant(cached_icon_source);
+		if (refreshed_icon) {
+			if (current_icon) DestroyIcon(current_icon);
+			current_icon = refreshed_icon;
+			nid.hIcon = current_icon;
+		}
+	}
 
 	if (!Shell_NotifyIconW(NIM_ADD, &nid)) {
 		Shell_NotifyIconW(NIM_MODIFY, &nid);
@@ -247,12 +609,46 @@ bool NativeTray::is_tray_active() const {
 #endif
 }
 
+Rect2i NativeTray::get_tray_rect() const {
+#ifdef _WIN32
+	if (!is_active || !hwnd) return Rect2i();
+
+	NOTIFYICONIDENTIFIER nii = {};
+	nii.cbSize = sizeof(nii);
+	nii.hWnd = hwnd;
+	nii.uID = nid.uID;
+
+	RECT rc = {};
+	if (SUCCEEDED(Shell_NotifyIconGetRect(&nii, &rc))) {
+		return Rect2i(rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
+	}
+#endif
+	return Rect2i();
+}
+
 void NativeTray::hide_window() {
 #ifdef _WIN32
 	if (Engine::get_singleton()->is_editor_hint()) return;
-	int64_t handle = DisplayServer::get_singleton()->window_get_native_handle(DisplayServer::WINDOW_HANDLE, 0);
+	DisplayServer *ds = DisplayServer::get_singleton();
+	if (!ds) return;
+
+	int64_t handle = ds->window_get_native_handle(DisplayServer::WINDOW_HANDLE, DisplayServer::MAIN_WINDOW_ID);
 	if (HWND godot_hwnd = reinterpret_cast<HWND>(handle)) {
+		if (!window_hidden_by_tray && IsWindowVisible(godot_hwnd)) {
+			was_maximized_before_hide = (IsZoomed(godot_hwnd) != FALSE) ||
+				(ds->window_get_mode(DisplayServer::MAIN_WINDOW_ID) == DisplayServer::WINDOW_MODE_MAXIMIZED);
+		}
+
+		// minimize before hiding so
+		// godot stops drawing to hidden swapchain
+		set_dwm_transitions_disabled(godot_hwnd, TRUE);
+		if (!IsIconic(godot_hwnd)) {
+			ShowWindow(godot_hwnd, SW_MINIMIZE);
+		}
 		ShowWindow(godot_hwnd, SW_HIDE);
+
+		window_hidden_by_tray = true;
+		hidden_timestamp_ms = GetTickCount64();
 	}
 #endif
 }
@@ -260,15 +656,54 @@ void NativeTray::hide_window() {
 void NativeTray::show_window() {
 #ifdef _WIN32
 	if (Engine::get_singleton()->is_editor_hint()) return;
-	int64_t handle = DisplayServer::get_singleton()->window_get_native_handle(DisplayServer::WINDOW_HANDLE, 0);
+	DisplayServer *ds = DisplayServer::get_singleton();
+	if (!ds) return;
+
+	int64_t handle = ds->window_get_native_handle(DisplayServer::WINDOW_HANDLE, DisplayServer::MAIN_WINDOW_ID);
 	if (HWND godot_hwnd = reinterpret_cast<HWND>(handle)) {
-		if (IsIconic(godot_hwnd)) {
+		restore_process_qos_and_priority();
+
+		ULONGLONG now_ms = GetTickCount64();
+		bool long_hidden = (hidden_timestamp_ms > 0) && ((now_ms - hidden_timestamp_ms) > (5ULL * 60ULL * 1000ULL));
+		if (system_resumed_while_hidden || long_hidden) {
+			prefetch_process_working_set(false);
+		}
+
+		set_dwm_transitions_disabled(godot_hwnd, TRUE);
+		if (!IsWindowVisible(godot_hwnd)) {
+			ShowWindow(godot_hwnd, SW_SHOWNOACTIVATE);
+		}
+
+		if (was_maximized_before_hide) {
+			ShowWindow(godot_hwnd, SW_SHOWMAXIMIZED);
+		} else if (IsIconic(godot_hwnd)) {
 			ShowWindow(godot_hwnd, SW_RESTORE);
 		} else {
 			ShowWindow(godot_hwnd, SW_SHOW);
 		}
-		SetForegroundWindow(godot_hwnd);
+		set_dwm_transitions_disabled(godot_hwnd, FALSE);
+
+		force_swapchain_and_dwm_refresh(godot_hwnd);
+		force_foreground_window(godot_hwnd);
+
+		window_hidden_by_tray = false;
+		system_resumed_while_hidden = false;
 	}
+#endif
+}
+
+bool NativeTray::is_window_hidden() const {
+#ifdef _WIN32
+	if (Engine::get_singleton()->is_editor_hint()) return false;
+	if (DisplayServer *ds = DisplayServer::get_singleton()) {
+		int64_t handle = ds->window_get_native_handle(DisplayServer::WINDOW_HANDLE, DisplayServer::MAIN_WINDOW_ID);
+		if (HWND godot_hwnd = reinterpret_cast<HWND>(handle)) {
+			return !IsWindowVisible(godot_hwnd) || window_hidden_by_tray;
+		}
+	}
+	return window_hidden_by_tray;
+#else
+	return false;
 #endif
 }
 
@@ -323,6 +758,9 @@ LRESULT CALLBACK NativeTray::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 		} else if (msg == WM_COMMAND) {
 			pSelf->process_menu_command(LOWORD(wParam));
 			return 0;
+		} else if (msg == WM_POWERBROADCAST) {
+			pSelf->process_power_broadcast(wParam, lParam);
+			return TRUE;
 		} else if (msg != 0 && msg == wm_taskbar_created) {
 			pSelf->recreate_tray();
 			return 0;
@@ -331,13 +769,46 @@ LRESULT CALLBACK NativeTray::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 	return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
+void NativeTray::process_power_broadcast(WPARAM wParam, LPARAM lParam) {
+	switch (wParam) {
+		case PBT_APMSUSPEND: {
+			call_deferred("emit_signal", "on_system_suspend");
+			break;
+		}
+		case PBT_APMRESUMEAUTOMATIC:
+		case PBT_APMRESUMESUSPEND: {
+			if (window_hidden_by_tray) {
+				system_resumed_while_hidden = true;
+			}
+
+			restore_process_qos_and_priority();
+			prefetch_process_working_set(true);
+
+			if (is_active && hwnd) {
+				if (!Shell_NotifyIconW(NIM_MODIFY, &nid)) {
+					Shell_NotifyIconW(NIM_ADD, &nid);
+				}
+			}
+
+			if (wParam == PBT_APMRESUMEAUTOMATIC) {
+				call_deferred("emit_signal", "on_system_resume");
+			}
+			break;
+		}
+	}
+}
+
 void NativeTray::process_tray_message(WPARAM wParam, LPARAM lParam) {
 	switch (LOWORD(lParam)) {
-		case WM_LBUTTONUP:
-			emit_signal("on_tray_left_clicked");
+		case WM_LBUTTONUP: {
+			SetForegroundWindow(hwnd);
+			PostMessageW(hwnd, WM_NULL, 0, 0);
+			call_deferred("emit_signal", "on_tray_left_clicked");
 			break;
+		}
 		case WM_RBUTTONUP: {
-			emit_signal("on_tray_right_clicked");
+			restore_process_qos_and_priority();
+			call_deferred("emit_signal", "on_tray_right_clicked");
 			
 			bool handled_by_custom = false;
 			if (custom_menu_instance_id.is_valid()) {
@@ -369,7 +840,7 @@ void NativeTray::process_tray_message(WPARAM wParam, LPARAM lParam) {
 							// force the window to be topmost to render over the taskbar.
 							// this bypasses godot's transient error when 'always on top' is used.
 							SetWindowPos(hw, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-							SetForegroundWindow(hw);
+							force_foreground_window(hw);
 						}
 					}
 					handled_by_custom = true;
@@ -380,21 +851,27 @@ void NativeTray::process_tray_message(WPARAM wParam, LPARAM lParam) {
 				POINT pt;
 				GetCursorPos(&pt);
 				SetForegroundWindow(hwnd);
-				TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd, nullptr);
-				PostMessage(hwnd, WM_NULL, 0, 0);
+				int cmd = TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, nullptr);
+				PostMessageW(hwnd, WM_NULL, 0, 0);
+				if (cmd >= static_cast<int>(MENU_ID_OFFSET)) {
+					process_menu_command(cmd);
+				}
 			}
 			break;
 		}
-		case WM_LBUTTONDBLCLK:
-			emit_signal("on_tray_double_clicked");
+		case WM_LBUTTONDBLCLK: {
+			SetForegroundWindow(hwnd);
+			PostMessageW(hwnd, WM_NULL, 0, 0);
+			call_deferred("emit_signal", "on_tray_double_clicked");
 			break;
+		}
 	}
 }
 
 void NativeTray::process_menu_command(int command_id) {
 	if (command_id >= MENU_ID_OFFSET) {
 		int actual_id = command_id - MENU_ID_OFFSET;
-		emit_signal("on_menu_item_selected", actual_id);
+		call_deferred("emit_signal", "on_menu_item_selected", actual_id);
 	}
 }
 
@@ -484,6 +961,10 @@ HICON NativeTray::create_icon_from_variant(const Variant &p_icon) {
 		Ref<Image> img = p_icon;
 		if (img.is_valid()) {
 			return create_icon_from_image(img);
+		}
+		Ref<Texture2D> tex = p_icon;
+		if (tex.is_valid()) {
+			return create_icon_from_image(tex->get_image());
 		}
 	} else if (p_icon.get_type() == Variant::STRING) {
 		String path = p_icon;

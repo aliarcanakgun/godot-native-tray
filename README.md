@@ -6,12 +6,13 @@ Currently, it only supports **Windows**.
 
 ## Features
 
-- **System Tray Icon:** Add your app to the Windows system tray with a custom icon and tooltip.
-- **Click Detection:** Detect left, right, and double clicks on the tray icon.
+- **System Tray Icon:** Add your app to the Windows system tray with a custom icon (`Image`, `Texture2D`, or native `.ico` path) and tooltip.
+- **Click Detection & Bounds:** Detect left, right, and double clicks on the tray icon, and query exact taskbar icon screen coordinates (`get_tray_rect()`).
 - **Explorer Crash / Restart Recovery:** Automatically intercepts Windows `TaskbarCreated` broadcast to restore the tray icon seamlessly if Windows Explorer restarts.
+- **Sleep / Standby Resilience:** Intercepts Windows `WM_POWERBROADCAST` events (`on_system_suspend`, `on_system_resume`), automatically prevents Windows 11 EcoQoS / timer throttling, prefetches paged-out memory on wake, and resynchronizes OpenGL/Vulkan swapchains when restoring the window.
 - **Native Context Menu:** Built-in standard Windows context menu with separators, disabled states, and checked states.
 - **Custom Godot Window Menu:** Ability to set a custom Godot `Window` node to act as the menu (bypassing the standard Win32 menu).
-- **Window Management:** Hide and show the main Godot window programmatically.
+- **Window Management:** Hide and show the main Godot window programmatically (`hide_window()`, `show_window()`, `is_window_hidden()`) while keeping Godot's main loop active.
 - **High Performance & Stability:** Designed with native Win32 API for low latency and high reliability.
 
 ## Installation
@@ -50,12 +51,12 @@ The extension provides a `NativeTray` singleton that you can access from any GDS
 
 ### Initializing the Tray
 
-**Add the icon to the system tray with a tooltip (accepts either `Image` or `.ico` path):**
+**Add the icon to the system tray with a tooltip (accepts `Image`, `Texture2D`, or `.ico` path):**
 ```gdscript
 # Using a native .ico file (auto selects best DPI resolution)
 NativeTray.init_tray("My Godot App", "res://icon.ico")
 
-# Using an Image (PNG, SVG, etc.)
+# Using a Texture2D or Image (PNG, SVG, etc.)
 var icon = preload("res://icon.svg").get_image()
 NativeTray.init_tray("My Godot App", icon)
 ```
@@ -64,22 +65,24 @@ NativeTray.init_tray("My Godot App", icon)
 
 **Update the icon or tooltip dynamically:**
 ```gdscript
-# Update using a .ico path or an Image
+# Update using a .ico path, Texture2D, or Image
 NativeTray.update_icon("res://status_busy.ico")
 # or NativeTray.update_icon(new_image)
 
 NativeTray.update_tooltip("Status: Connected")
 ```
 
-### Handling Clicks
+### Handling Clicks & Power Events
 
-**Connect to tray click signals:**
+**Connect to tray click and system power signals:**
 ```gdscript
 func _ready():
     NativeTray.on_tray_left_clicked.connect(_on_left_click)
     NativeTray.on_tray_right_clicked.connect(_on_right_click)
     NativeTray.on_tray_double_clicked.connect(_on_double_click)
     NativeTray.on_tray_recreated.connect(_on_tray_recreated)
+    NativeTray.on_system_suspend.connect(_on_system_suspend)
+    NativeTray.on_system_resume.connect(_on_system_resume)
 
 func _on_left_click():
     print("Tray left clicked")
@@ -92,6 +95,12 @@ func _on_double_click():
 
 func _on_tray_recreated():
     print("Explorer restarted, tray icon automatically recreated")
+
+func _on_system_suspend():
+    print("PC is entering sleep/standby mode")
+
+func _on_system_resume():
+    print("PC resumed from sleep/standby mode")
 ```
 
 ### Native Context Menu
@@ -135,6 +144,12 @@ NativeTray.hide_window()
 
 # Brings the window back to the front
 NativeTray.show_window()
+
+# Check if the main window is currently hidden in tray
+var hidden: bool = NativeTray.is_window_hidden()
+
+# Get the tray icon's bounding rectangle in screen coordinates
+var icon_rect: Rect2i = NativeTray.get_tray_rect()
 ```
 
 ### Cleanup
