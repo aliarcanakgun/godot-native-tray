@@ -4,6 +4,7 @@
 #include <godot_cpp/classes/display_server.hpp>
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/file_access.hpp>
+#include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/classes/scene_tree.hpp>
@@ -11,6 +12,8 @@
 using namespace godot;
 
 #ifdef _WIN32
+#include <psapi.h>
+
 const UINT WM_TRAYICON = WM_USER + 1;
 const UINT MENU_ID_OFFSET = 1000;
 UINT NativeTray::wm_taskbar_created = 0;
@@ -75,8 +78,44 @@ typedef HRESULT(WINAPI *PFN_DwmSetWindowAttribute)(
 
 typedef HRESULT(WINAPI *PFN_DwmFlush)(void);
 
-typedef UINT(WINAPI *PFN_timeBeginPeriod)(UINT uPeriod);
-typedef UINT(WINAPI *PFN_timeEndPeriod)(UINT uPeriod);
+typedef BOOL(WINAPI *PFN_GetProcessMemoryInfo)(HANDLE hProcess, PROCESS_MEMORY_COUNTERS *ppsmemCounters, DWORD cb);
+
+typedef UINT(WINAPI *PFN_GetDpiForWindow)(HWND hwnd);
+typedef int(WINAPI *PFN_GetSystemMetricsForDpi)(int nIndex, UINT dpi);
+
+void get_small_icon_size(HWND p_hwnd, int &r_cx, int &r_cy) {
+	r_cx = 0;
+	r_cy = 0;
+	HMODULE hUser = GetModuleHandleW(L"user32.dll");
+	if (hUser && p_hwnd) {
+		PFN_GetDpiForWindow pfnDpi = reinterpret_cast<PFN_GetDpiForWindow>(GetProcAddress(hUser, "GetDpiForWindow"));
+		PFN_GetSystemMetricsForDpi pfnMetrics = reinterpret_cast<PFN_GetSystemMetricsForDpi>(GetProcAddress(hUser, "GetSystemMetricsForDpi"));
+		if (pfnDpi && pfnMetrics) {
+			UINT dpi = pfnDpi(p_hwnd);
+			if (dpi > 0) {
+				r_cx = pfnMetrics(SM_CXSMICON, dpi);
+				r_cy = pfnMetrics(SM_CYSMICON, dpi);
+			}
+		}
+	}
+	if (r_cx <= 0) r_cx = GetSystemMetrics(SM_CXSMICON);
+	if (r_cy <= 0) r_cy = GetSystemMetrics(SM_CYSMICON);
+	if (r_cx <= 0) r_cx = 16;
+	if (r_cy <= 0) r_cy = 16;
+}
+
+SIZE_T query_working_set() {
+	HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+	if (!hKernel32) return 0;
+	PFN_GetProcessMemoryInfo pfnInfo = reinterpret_cast<PFN_GetProcessMemoryInfo>(
+		GetProcAddress(hKernel32, "K32GetProcessMemoryInfo")
+	);
+	PROCESS_MEMORY_COUNTERS pmc = {};
+	if (pfnInfo && pfnInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+		return pmc.WorkingSetSize;
+	}
+	return 0;
+}
 
 void set_dwm_transitions_disabled(HWND p_hwnd, BOOL p_disabled) {
 	if (!p_hwnd) return;
@@ -217,6 +256,7 @@ void NativeTray::_bind_shutdown_cleanup() {
 
 void NativeTray::_on_engine_shutdown() {
 	remove_tray();
+	disconnect_all_signals();
 }
 
 #ifdef _WIN32
@@ -264,17 +304,36 @@ void NativeTray::restore_process_qos_and_priority() {
 			pfnSetProcInfo(hProcess, 1, &mem_prio, sizeof(mem_prio));
 		}
 	}
+}
 
-	// refresh timer resolution
-	// for low processor usage mode
-	HMODULE hWinmm = GetModuleHandleW(L"winmm.dll");
-	if (hWinmm) {
-		PFN_timeBeginPeriod pfnBegin = reinterpret_cast<PFN_timeBeginPeriod>(GetProcAddress(hWinmm, "timeBeginPeriod"));
-		PFN_timeEndPeriod pfnEnd = reinterpret_cast<PFN_timeEndPeriod>(GetProcAddress(hWinmm, "timeEndPeriod"));
-		if (pfnBegin && pfnEnd) {
-			pfnBegin(1);
-			pfnEnd(1);
-		}
+void NativeTray::pin_working_set() {
+	if (working_set_pinned) return;
+
+	constexpr SIZE_T MAX_PIN_BYTES = 1024ULL * 1024ULL * 1024ULL;
+	constexpr SIZE_T MAX_HEADROOM = 64ULL * 1024ULL * 1024ULL;
+
+	SIZE_T current = query_working_set();
+	if (current == 0) return;
+	hidden_working_set = current;
+
+	HANDLE hProcess = GetCurrentProcess();
+	DWORD flags = 0;
+	if (!GetProcessWorkingSetSizeEx(hProcess, &orig_ws_min, &orig_ws_max, &flags)) return;
+
+	// minimize trims the working set
+	SIZE_T pin = current < MAX_PIN_BYTES ? current : MAX_PIN_BYTES;
+	SIZE_T new_max = orig_ws_max > pin + MAX_HEADROOM ? orig_ws_max : pin + MAX_HEADROOM;
+	if (SetProcessWorkingSetSizeEx(hProcess, pin, new_max, QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE)) {
+		working_set_pinned = true;
+	}
+}
+
+void NativeTray::unpin_working_set() {
+	if (!working_set_pinned) return;
+	working_set_pinned = false;
+
+	if (orig_ws_max > 0) {
+		SetProcessWorkingSetSizeEx(GetCurrentProcess(), orig_ws_min, orig_ws_max, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
 	}
 }
 
@@ -305,7 +364,11 @@ DWORD WINAPI NativeTray::PrefetchWorkerThreadProc(LPVOID lpParameter) {
 	const uint8_t *max_addr = static_cast<const uint8_t *>(sysInfo.lpMaximumApplicationAddress);
 
 	constexpr size_t BATCH_SIZE = 128;
-	constexpr SIZE_T MAX_PREFETCH_BYTES = 512ULL * 1024ULL * 1024ULL;
+	constexpr SIZE_T DEFAULT_PREFETCH_BYTES = 512ULL * 1024ULL * 1024ULL;
+	SIZE_T MAX_PREFETCH_BYTES = reinterpret_cast<SIZE_T>(lpParameter);
+	if (MAX_PREFETCH_BYTES == 0 || MAX_PREFETCH_BYTES > DEFAULT_PREFETCH_BYTES) {
+		MAX_PREFETCH_BYTES = DEFAULT_PREFETCH_BYTES;
+	}
 	TrayWin32MemoryRangeEntry entries[BATCH_SIZE];
 	size_t entry_count = 0;
 	SIZE_T total_prefetched = 0;
@@ -349,47 +412,53 @@ DWORD WINAPI NativeTray::PrefetchWorkerThreadProc(LPVOID lpParameter) {
 	return 0;
 }
 
-void NativeTray::prefetch_process_working_set(bool p_async) {
-	if (p_async) {
-		QueueUserWorkItem(&NativeTray::PrefetchWorkerThreadProc, nullptr, WT_EXECUTEDEFAULT);
-	} else {
-		PrefetchWorkerThreadProc(nullptr);
+void NativeTray::prefetch_process_working_set() {
+	// always async
+	QueueUserWorkItem(&NativeTray::PrefetchWorkerThreadProc, reinterpret_cast<LPVOID>(hidden_working_set), WT_EXECUTEDEFAULT);
+}
+
+void NativeTray::prefetch_if_stale() {
+	if (!window_hidden_by_tray) return;
+
+	bool long_hidden = (hidden_timestamp_ms > 0) && ((GetTickCount64() - hidden_timestamp_ms) > (5ULL * 60ULL * 1000ULL));
+	if (system_resumed_while_hidden || (long_hidden && !working_set_pinned)) {
+		prefetch_process_working_set();
 	}
 }
 
-void NativeTray::force_swapchain_and_dwm_refresh(HWND p_godot_hwnd) {
+void NativeTray::force_swapchain_and_dwm_refresh(HWND p_godot_hwnd, bool p_full) {
 	if (!p_godot_hwnd) return;
 
-	SetWindowPos(
-		p_godot_hwnd,
-		nullptr,
-		0, 0, 0, 0,
-		SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
-	);
+	// swapchain rebuild is only needed after a sleep cycle
+	if (p_full) {
+		SetWindowPos(
+			p_godot_hwnd,
+			nullptr,
+			0, 0, 0, 0,
+			SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+		);
 
-	// rebind vsync to refresh swapchain state
-	if (DisplayServer *ds = DisplayServer::get_singleton()) {
-		DisplayServer::VSyncMode vsync = ds->window_get_vsync_mode(DisplayServer::MAIN_WINDOW_ID);
-		ds->window_set_vsync_mode(vsync, DisplayServer::MAIN_WINDOW_ID);
-	}
+		// rebind vsync to refresh swapchain state
+		if (DisplayServer *ds = DisplayServer::get_singleton()) {
+			DisplayServer::VSyncMode vsync = ds->window_get_vsync_mode(DisplayServer::MAIN_WINDOW_ID);
+			ds->window_set_vsync_mode(vsync, DisplayServer::MAIN_WINDOW_ID);
+		}
 
-	RECT rc = {};
-	if (GetClientRect(p_godot_hwnd, &rc)) {
-		LONG w = rc.right - rc.left;
-		LONG h = rc.bottom - rc.top;
-		if (w > 0 && h > 0) {
-			WPARAM size_state = IsZoomed(p_godot_hwnd) ? SIZE_MAXIMIZED : SIZE_RESTORED;
-			SendMessageW(p_godot_hwnd, WM_SIZE, size_state, MAKELPARAM(w, h));
+		RECT rc = {};
+		if (GetClientRect(p_godot_hwnd, &rc)) {
+			LONG w = rc.right - rc.left;
+			LONG h = rc.bottom - rc.top;
+			if (w > 0 && h > 0) {
+				WPARAM size_state = IsZoomed(p_godot_hwnd) ? SIZE_MAXIMIZED : SIZE_RESTORED;
+				SendMessageW(p_godot_hwnd, WM_SIZE, size_state, MAKELPARAM(w, h));
+			}
 		}
 	}
 
-	RedrawWindow(
-		p_godot_hwnd,
-		nullptr,
-		nullptr,
-		RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW
-	);
-	flush_dwm_composition();
+	RedrawWindow(p_godot_hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
+	if (p_full) {
+		flush_dwm_composition();
+	}
 
 	call_deferred("_deferred_post_show_refresh");
 }
@@ -431,6 +500,11 @@ void NativeTray::force_foreground_window(HWND p_godot_hwnd) {
 
 void NativeTray::init_tray(const String &p_tooltip, const Variant &p_icon) {
 #ifdef _WIN32
+	if (OS::get_singleton()->get_thread_caller_id() != OS::get_singleton()->get_main_thread_id()) {
+		ERR_PRINT("NativeTray: init_tray must be called from the main thread");
+		return;
+	}
+
 	HINSTANCE hInstance = GetModuleHandle(nullptr);
 
 	if (wm_taskbar_created == 0) {
@@ -577,7 +651,6 @@ void NativeTray::remove_tray() {
 	cleanup_tray_resources();
 #endif
 	cached_icon_source = Variant();
-	disconnect_all_signals();
 }
 
 void NativeTray::recreate_tray() {
@@ -639,6 +712,14 @@ void NativeTray::hide_window() {
 				(ds->window_get_mode(DisplayServer::MAIN_WINDOW_ID) == DisplayServer::WINDOW_MODE_MAXIMIZED);
 		}
 
+		if (!window_hidden_by_tray) {
+			hidden_timestamp_ms = GetTickCount64();
+		}
+
+		
+		restore_process_qos_and_priority();
+		pin_working_set();
+
 		// minimize before hiding so
 		// godot stops drawing to hidden swapchain
 		set_dwm_transitions_disabled(godot_hwnd, TRUE);
@@ -648,7 +729,6 @@ void NativeTray::hide_window() {
 		ShowWindow(godot_hwnd, SW_HIDE);
 
 		window_hidden_by_tray = true;
-		hidden_timestamp_ms = GetTickCount64();
 	}
 #endif
 }
@@ -663,11 +743,8 @@ void NativeTray::show_window() {
 	if (HWND godot_hwnd = reinterpret_cast<HWND>(handle)) {
 		restore_process_qos_and_priority();
 
-		ULONGLONG now_ms = GetTickCount64();
-		bool long_hidden = (hidden_timestamp_ms > 0) && ((now_ms - hidden_timestamp_ms) > (5ULL * 60ULL * 1000ULL));
-		if (system_resumed_while_hidden || long_hidden) {
-			prefetch_process_working_set(false);
-		}
+		prefetch_if_stale();
+		unpin_working_set();
 
 		set_dwm_transitions_disabled(godot_hwnd, TRUE);
 		if (!IsWindowVisible(godot_hwnd)) {
@@ -683,7 +760,7 @@ void NativeTray::show_window() {
 		}
 		set_dwm_transitions_disabled(godot_hwnd, FALSE);
 
-		force_swapchain_and_dwm_refresh(godot_hwnd);
+		force_swapchain_and_dwm_refresh(godot_hwnd, system_resumed_while_hidden);
 		force_foreground_window(godot_hwnd);
 
 		window_hidden_by_tray = false;
@@ -782,7 +859,7 @@ void NativeTray::process_power_broadcast(WPARAM wParam, LPARAM lParam) {
 			}
 
 			restore_process_qos_and_priority();
-			prefetch_process_working_set(true);
+			prefetch_process_working_set();
 
 			if (is_active && hwnd) {
 				if (!Shell_NotifyIconW(NIM_MODIFY, &nid)) {
@@ -801,6 +878,8 @@ void NativeTray::process_power_broadcast(WPARAM wParam, LPARAM lParam) {
 void NativeTray::process_tray_message(WPARAM wParam, LPARAM lParam) {
 	switch (LOWORD(lParam)) {
 		case WM_LBUTTONUP: {
+			// start paging in before the script gets around to show_window
+			prefetch_if_stale();
 			SetForegroundWindow(hwnd);
 			PostMessageW(hwnd, WM_NULL, 0, 0);
 			call_deferred("emit_signal", "on_tray_left_clicked");
@@ -860,6 +939,7 @@ void NativeTray::process_tray_message(WPARAM wParam, LPARAM lParam) {
 			break;
 		}
 		case WM_LBUTTONDBLCLK: {
+			prefetch_if_stale();
 			SetForegroundWindow(hwnd);
 			PostMessageW(hwnd, WM_NULL, 0, 0);
 			call_deferred("emit_signal", "on_tray_double_clicked");
@@ -892,10 +972,8 @@ HICON NativeTray::create_icon_from_image(const Ref<Image> &p_image) {
 		img->convert(Image::FORMAT_RGBA8);
 	}
 
-	int sm_cx = GetSystemMetrics(SM_CXSMICON);
-	int sm_cy = GetSystemMetrics(SM_CYSMICON);
-	if (sm_cx <= 0) sm_cx = 16;
-	if (sm_cy <= 0) sm_cy = 16;
+	int sm_cx, sm_cy;
+	get_small_icon_size(hwnd, sm_cx, sm_cy);
 
 	if (img->get_width() > sm_cx || img->get_height() > sm_cy) {
 		img->resize(sm_cx, sm_cy, Image::INTERPOLATE_LANCZOS);
@@ -1000,10 +1078,8 @@ HICON NativeTray::create_icon_from_file(const String &p_path) {
 	
 	String global_path = ProjectSettings::get_singleton()->globalize_path(p_path);
 	Char16String utf16 = global_path.utf16();
-	int target_cx = GetSystemMetrics(SM_CXSMICON);
-	int target_cy = GetSystemMetrics(SM_CYSMICON);
-	if (target_cx <= 0) target_cx = 16;
-	if (target_cy <= 0) target_cy = 16;
+	int target_cx, target_cy;
+	get_small_icon_size(hwnd, target_cx, target_cy);
 
 	HICON hIcon = reinterpret_cast<HICON>(LoadImageW(
 		nullptr,
@@ -1030,10 +1106,8 @@ HICON NativeTray::create_icon_from_ico_data(const uint8_t *p_data, size_t p_size
 
 	const IcoDirEntry *entries = reinterpret_cast<const IcoDirEntry*>(p_data + sizeof(IcoHeader));
 
-	int target_cx = GetSystemMetrics(SM_CXSMICON);
-	int target_cy = GetSystemMetrics(SM_CYSMICON);
-	if (target_cx <= 0) target_cx = 16;
-	if (target_cy <= 0) target_cy = 16;
+	int target_cx, target_cy;
+	get_small_icon_size(hwnd, target_cx, target_cy);
 
 	int best_index = -1;
 	int best_score = 100000;
@@ -1063,7 +1137,7 @@ HICON NativeTray::create_icon_from_ico_data(const uint8_t *p_data, size_t p_size
 	if (best_index < 0) return nullptr;
 
 	const IcoDirEntry &best = entries[best_index];
-	if (best.image_offset + best.bytes_in_res > p_size) {
+	if (static_cast<size_t>(best.image_offset) + best.bytes_in_res > p_size) {
 		return nullptr;
 	}
 

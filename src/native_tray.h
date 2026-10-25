@@ -31,6 +31,10 @@ private:
 	bool was_maximized_before_hide = false;
 	bool system_resumed_while_hidden = false;
 	ULONGLONG hidden_timestamp_ms = 0;
+	SIZE_T hidden_working_set = 0;
+	SIZE_T orig_ws_min = 0;
+	SIZE_T orig_ws_max = 0;
+	bool working_set_pinned = false;
 	Variant cached_icon_source;
 
 	static UINT wm_taskbar_created;
@@ -43,8 +47,11 @@ private:
 	void process_power_broadcast(WPARAM wParam, LPARAM lParam);
 
 	void restore_process_qos_and_priority();
-	void prefetch_process_working_set(bool p_async = false);
-	void force_swapchain_and_dwm_refresh(HWND p_godot_hwnd);
+	void prefetch_process_working_set();
+	void prefetch_if_stale();
+	void pin_working_set();
+	void unpin_working_set();
+	void force_swapchain_and_dwm_refresh(HWND p_godot_hwnd, bool p_full);
 	void force_foreground_window(HWND p_godot_hwnd);
 	void _deferred_post_show_refresh();
 
